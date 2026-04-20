@@ -37,6 +37,7 @@ def main() -> None:
     patch_gdn_metadata()
     patch_gdn_layer()
     patch_qwen_attention()
+    patch_unified_attention()
     patch_gpu_runner()
 
 
@@ -136,6 +137,25 @@ def patch_gdn_layer() -> None:
                 """    # DDTREE_QWEN36_GDN_LAYER: process a flat DDTree by depth.  Each\n    # node owns one speculative state slot; before computing a child node we\n    # copy its parent's GDN state into that slot, then let the existing one-token\n    # decode kernels update the slot in place.\n    def _copy_tree_state(\n        self,\n        state: torch.Tensor,\n        parent_slots: torch.Tensor,\n        node_slots: torch.Tensor,\n    ) -> None:\n        valid = (parent_slots > 0) & (node_slots > 0)\n        if not bool(valid.all().item()):\n            parent_slots = parent_slots[valid]\n            node_slots = node_slots[valid]\n        if node_slots.numel() == 0:\n            return\n        state[node_slots] = state.index_select(0, parent_slots).clone()\n\n    def _forward_core_tree_spec(\n        self,\n        mixed_qkv: torch.Tensor,\n        b: torch.Tensor,\n        a: torch.Tensor,\n        core_attn_out: torch.Tensor,\n        attn_metadata: GDNAttentionMetadata,\n    ):\n        if attn_metadata.num_prefills != 0 or attn_metadata.num_decodes != 0:\n            raise NotImplementedError(\n                "DFlash+DDTree GDN prototype only supports pure speculative "\n                "decode batches."\n            )\n        assert attn_metadata.spec_state_indices_tensor is not None\n        assert attn_metadata.tree_parent_indices is not None\n        assert attn_metadata.tree_depths is not None\n\n        num_spec_decodes = attn_metadata.num_spec_decodes\n        tree_parent_indices = attn_metadata.tree_parent_indices\n        tree_depths = attn_metadata.tree_depths\n        tree_len = int(tree_parent_indices.numel())\n        num_actual_tokens = attn_metadata.num_actual_tokens\n        assert num_actual_tokens == num_spec_decodes * tree_len, (\n            num_actual_tokens,\n            num_spec_decodes,\n            tree_len,\n        )\n\n        self_kv_cache = self.kv_cache\n        conv_state = (\n            self_kv_cache[0]\n            if is_conv_state_dim_first()\n            else self_kv_cache[0].transpose(-1, -2)\n        )\n        ssm_state = self_kv_cache[1]\n        conv_weights = self.conv1d.weight.view(\n            self.conv1d.weight.size(0), self.conv1d.weight.size(2)\n        )\n\n        spec_state_indices = attn_metadata.spec_state_indices_tensor[\n            :num_spec_decodes, :tree_len\n        ].long()\n        mixed_tree = mixed_qkv[:num_actual_tokens].view(num_spec_decodes, tree_len, -1)\n        b_tree = b[:num_actual_tokens].view(num_spec_decodes, tree_len, -1)\n        a_tree = a[:num_actual_tokens].view(num_spec_decodes, tree_len, -1)\n        core_tree = torch.empty_like(core_attn_out[:num_actual_tokens]).view(\n            num_spec_decodes, tree_len, *core_attn_out.shape[1:]\n        )\n\n        max_depth = int(tree_depths.max().item())\n        for depth in range(max_depth + 1):\n            depth_nodes = torch.nonzero(tree_depths == depth, as_tuple=False).flatten()\n            if depth_nodes.numel() == 0:\n                continue\n            node_slots = spec_state_indices[:, depth_nodes].reshape(-1)\n            if depth > 0:\n                parent_nodes = tree_parent_indices.index_select(0, depth_nodes)\n                parent_slots = spec_state_indices[:, parent_nodes].reshape(-1)\n                self._copy_tree_state(conv_state, parent_slots, node_slots)\n                self._copy_tree_state(ssm_state, parent_slots, node_slots)\n\n            depth_mixed = mixed_tree[:, depth_nodes].reshape(-1, mixed_tree.shape[-1])\n            depth_b = b_tree[:, depth_nodes].reshape(-1, b_tree.shape[-1])\n            depth_a = a_tree[:, depth_nodes].reshape(-1, a_tree.shape[-1])\n\n            depth_mixed = causal_conv1d_update(\n                depth_mixed,\n                conv_state,\n                conv_weights,\n                self.conv1d.bias,\n                self.activation,\n                conv_state_indices=node_slots.to(torch.int32),\n                validate_data=False,\n            )\n            query, key, value = self.rearrange_mixed_qkv(depth_mixed)\n            cu_seqlens = torch.arange(\n                node_slots.numel() + 1,\n                dtype=torch.int32,\n                device=node_slots.device,\n            )\n            core_depth, _ = fused_sigmoid_gating_delta_rule_update(\n                A_log=self.A_log,\n                a=depth_a,\n                b=depth_b,\n                dt_bias=self.dt_bias,\n                q=query,\n                k=key,\n                v=value,\n                initial_state=ssm_state,\n                inplace_final_state=True,\n                cu_seqlens=cu_seqlens,\n                ssm_state_indices=node_slots.to(torch.int32),\n                use_qk_l2norm_in_kernel=True,\n            )\n            core_tree[:, depth_nodes] = core_depth.squeeze(0).view(\n                num_spec_decodes,\n                depth_nodes.numel(),\n                *core_attn_out.shape[1:],\n            )\n\n        core_attn_out[:num_actual_tokens] = core_tree.reshape_as(\n            core_attn_out[:num_actual_tokens]\n        )\n\n    def _forward_core(\n        self,\n""",
             ),
             (
+                """        valid = (parent_slots > 0) & (node_slots > 0)
+""",
+                """        valid = (parent_slots >= 0) & (node_slots >= 0)
+""",
+            ),
+            (
+                """        spec_state_indices = attn_metadata.spec_state_indices_tensor[
+            :num_spec_decodes, :tree_len
+        ].long()
+        mixed_tree = mixed_qkv[:num_actual_tokens].view(num_spec_decodes, tree_len, -1)
+""",
+                """        spec_state_indices = attn_metadata.spec_state_indices_tensor[
+            :num_spec_decodes, :tree_len
+        ].long()
+        self._ddtree_last_spec_state_indices = spec_state_indices
+        mixed_tree = mixed_qkv[:num_actual_tokens].view(num_spec_decodes, tree_len, -1)
+""",
+            ),
+            (
                 """        num_actual_tokens = attn_metadata.num_actual_tokens\n        num_accepted_tokens = attn_metadata.num_accepted_tokens\n\n        mixed_qkv = mixed_qkv[:num_actual_tokens]\n""",
                 """        num_actual_tokens = attn_metadata.num_actual_tokens\n        num_accepted_tokens = attn_metadata.num_accepted_tokens\n\n        if (\n            spec_sequence_masks is not None\n            and getattr(attn_metadata, "tree_parent_indices", None) is not None\n        ):\n            return self._forward_core_tree_spec(\n                mixed_qkv=mixed_qkv,\n                b=b,\n                a=a,\n                core_attn_out=core_attn_out,\n                attn_metadata=attn_metadata,\n            )\n\n        mixed_qkv = mixed_qkv[:num_actual_tokens]\n""",
             ),
@@ -164,6 +184,23 @@ def patch_qwen_attention() -> None:
     )
 
 
+def patch_unified_attention() -> None:
+    patch(
+        "vllm/v1/attention/ops/triton_unified_attention.py",
+        "DDTREE_QWEN36_UNIFIED_ATTENTION",
+        [
+            (
+                """            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0\n""",
+                """            # DDTREE_QWEN36_UNIFIED_ATTENTION: query-query bias loads\n            # must mask context keys elementwise to avoid negative indices.\n            is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)\n""",
+            ),
+            (
+                """            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0\n""",
+                """            is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)\n""",
+            ),
+        ],
+    )
+
+
 def patch_gpu_runner() -> None:
     patch(
         "vllm/v1/worker/gpu_model_runner.py",
@@ -183,7 +220,35 @@ def patch_gpu_runner() -> None:
             ),
             (
                 """    def _update_streaming_request(\n        self, req_id: str, new_req_data: NewRequestData\n""",
-                """    # DDTREE_QWEN36_RUNNER: compact accepted tree-path states into the\n    # linear speculative slots that vLLM's existing bookkeeping expects.\n    def _ddtree_commit_tree_cache(\n        self,\n        accepted_tree_indices: torch.Tensor,\n        hidden_states: torch.Tensor,\n        aux_hidden_states: list[torch.Tensor] | None,\n        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,\n    ) -> None:\n        if slot_mappings is None or not isinstance(slot_mappings, dict):\n            raise NotImplementedError(\n                "DFlash+DDTree prototype requires non-ubatched slot mappings."\n            )\n        num_reqs = self.input_batch.num_reqs\n        accepted_tree_indices = accepted_tree_indices[:num_reqs]\n        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]\n        static_context = self.compilation_config.static_forward_context\n\n        def copy_state_tensor(\n            state: torch.Tensor,\n            src_slots: torch.Tensor,\n            dst_slots: torch.Tensor,\n            is_paged_kv: bool,\n        ) -> None:\n            valid = (src_slots >= 0) & (dst_slots >= 0) & (src_slots != dst_slots)\n            if not bool(valid.any().item()):\n                return\n            src_slots = src_slots[valid].long()\n            dst_slots = dst_slots[valid].long()\n            if is_paged_kv:\n                flat = state.view(-1, *state.shape[3:])\n                flat[dst_slots] = flat.index_select(0, src_slots).clone()\n            else:\n                state[dst_slots] = state.index_select(0, src_slots).clone()\n\n        for req_idx in range(num_reqs):\n            row = accepted_tree_indices[req_idx]\n            valid_count = int((row >= 0).sum().item())\n            if valid_count <= 1:\n                continue\n            src_local = row[:valid_count].long()\n            dst_local = torch.arange(valid_count, device=row.device, dtype=torch.long)\n            base = query_start_loc[req_idx].long()\n            src_abs = base + src_local\n            dst_abs = base + dst_local\n\n            hidden_states[dst_abs] = hidden_states.index_select(0, src_abs).clone()\n            if aux_hidden_states is not None:\n                for aux in aux_hidden_states:\n                    aux[dst_abs] = aux.index_select(0, src_abs).clone()\n\n            for layer_name, slot_mapping in slot_mappings.items():\n                layer = static_context.get(layer_name)\n                kv_cache = getattr(layer, "kv_cache", None)\n                if kv_cache is None:\n                    continue\n                src_slots = slot_mapping[src_abs]\n                dst_slots = slot_mapping[dst_abs]\n                if torch.is_tensor(kv_cache):\n                    if kv_cache.dim() >= 5 and kv_cache.shape[0] == 2:\n                        key_cache, value_cache = kv_cache.unbind(0)\n                        copy_state_tensor(key_cache, src_slots, dst_slots, True)\n                        copy_state_tensor(value_cache, src_slots, dst_slots, True)\n                elif isinstance(kv_cache, (list, tuple)):\n                    for state in kv_cache:\n                        copy_state_tensor(state, src_slots, dst_slots, False)\n\n    def _update_streaming_request(\n        self, req_id: str, new_req_data: NewRequestData\n""",
+                """    # DDTREE_QWEN36_RUNNER: compact accepted tree-path states into the\n    # linear speculative slots that vLLM's existing bookkeeping expects.\n    def _ddtree_commit_tree_cache(\n        self,\n        accepted_tree_indices: torch.Tensor,\n        hidden_states: torch.Tensor,\n        aux_hidden_states: list[torch.Tensor] | None,\n        slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,\n    ) -> None:\n        if slot_mappings is None or not isinstance(slot_mappings, dict):\n            raise NotImplementedError(\n                "DFlash+DDTree prototype requires non-ubatched slot mappings."\n            )\n        num_reqs = self.input_batch.num_reqs\n        accepted_tree_indices = accepted_tree_indices[:num_reqs]\n        query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]\n        static_context = self.compilation_config.static_forward_context\n\n        def copy_state_tensor(\n            state: torch.Tensor,\n            src_slots: torch.Tensor,\n            dst_slots: torch.Tensor,\n            is_paged_kv: bool,\n        ) -> None:\n            valid = (src_slots >= 0) & (dst_slots >= 0) & (src_slots != dst_slots)\n            if not bool(valid.any().item()):\n                return\n            src_slots = src_slots[valid].long()\n            dst_slots = dst_slots[valid].long()\n            if is_paged_kv:\n                block_size = state.shape[1]\n                max_slot = state.shape[0] * block_size\n                in_range = (src_slots < max_slot) & (dst_slots < max_slot)\n                if not bool(in_range.any().item()):\n                    return\n                src_slots = src_slots[in_range]\n                dst_slots = dst_slots[in_range]\n                src_blocks = torch.div(src_slots, block_size, rounding_mode="floor")\n                src_offsets = src_slots % block_size\n                dst_blocks = torch.div(dst_slots, block_size, rounding_mode="floor")\n                dst_offsets = dst_slots % block_size\n                state[dst_blocks, dst_offsets] = state[\n                    src_blocks, src_offsets\n                ].clone()\n            else:\n                state[dst_slots] = state.index_select(0, src_slots).clone()\n\n        for req_idx in range(num_reqs):\n            row = accepted_tree_indices[req_idx]\n            valid_count = int((row >= 0).sum().item())\n            if valid_count <= 1:\n                continue\n            src_local = row[:valid_count].long()\n            dst_local = torch.arange(valid_count, device=row.device, dtype=torch.long)\n            base = query_start_loc[req_idx].long()\n            src_abs = base + src_local\n            dst_abs = base + dst_local\n\n            hidden_states[dst_abs] = hidden_states.index_select(0, src_abs).clone()\n            if aux_hidden_states is not None:\n                for aux in aux_hidden_states:\n                    aux[dst_abs] = aux.index_select(0, src_abs).clone()\n\n            for layer_name, slot_mapping in slot_mappings.items():\n                layer = static_context.get(layer_name)\n                kv_cache = getattr(layer, "kv_cache", None)\n                if kv_cache is None:\n                    continue\n                src_slots = slot_mapping[src_abs]\n                dst_slots = slot_mapping[dst_abs]\n                if torch.is_tensor(kv_cache):\n                    if kv_cache.dim() >= 5 and kv_cache.shape[0] == 2:\n                        key_cache, value_cache = kv_cache.unbind(0)\n                        copy_state_tensor(key_cache, src_slots, dst_slots, True)\n                        copy_state_tensor(value_cache, src_slots, dst_slots, True)\n                elif isinstance(kv_cache, (list, tuple)):\n                    # Recurrent state tensors use mamba/GDN state-slot indices,\n                    # not paged attention token-slot indices. The GDN tree path\n                    # already updates tree state slots during verification; do not\n                    # copy them through attention slot mappings here.\n                    continue\n\n    def _update_streaming_request(\n        self, req_id: str, new_req_data: NewRequestData\n""",
+            ),
+            (
+                """                elif isinstance(kv_cache, (list, tuple)):
+                    # Recurrent state tensors use mamba/GDN state-slot indices,
+                    # not paged attention token-slot indices. The GDN tree path
+                    # already updates tree state slots during verification; do not
+                    # copy them through attention slot mappings here.
+                    continue
+""",
+                """                elif isinstance(kv_cache, (list, tuple)):
+                    spec_state_indices = getattr(
+                        layer, "_ddtree_last_spec_state_indices", None
+                    )
+                    if spec_state_indices is None:
+                        continue
+                    final_node = row[valid_count - 1].view(1).long()
+                    src_recurrent_slots = spec_state_indices[req_idx].index_select(
+                        0, final_node
+                    )
+                    dst_recurrent_slots = spec_state_indices[req_idx, :1].long()
+                    for state in kv_cache:
+                        copy_state_tensor(
+                            state,
+                            src_recurrent_slots,
+                            dst_recurrent_slots,
+                            False,
+                        )
+""",
             ),
         ],
     )
