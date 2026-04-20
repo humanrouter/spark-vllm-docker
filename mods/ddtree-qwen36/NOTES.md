@@ -29,6 +29,17 @@ Local results from April 20, 2026:
 | root top-2 plus short top-1 chain | 4 | correct text, about 15.0 tok/s, roughly 30-38% draft-token acceptance |
 | root top-2 only | 2 | correct text, warm runs about 16.5-17.6 tok/s, roughly 39-45% draft-token acceptance |
 
+FP8 target diagnostic from April 20, 2026:
+
+`Qwen/Qwen3.6-35B-A3B-FP8` launched with the same DFlash draft model and DDTree
+patch after removing FP8 KV cache from the prototype recipe. FP8 KV cache hit a
+vLLM KV page-size assertion during startup; BF16/auto KV cache avoided it.
+
+| Tree | Draft tokens | Result |
+| --- | ---: | --- |
+| root top-2 only `[(0,), (1,)]` | 2 | coherent greedy smoke output; about 41% average draft acceptance; first-position acceptance about 82%, second sibling position 0% by topology |
+| root top-2 plus top-1 chain `[(0,), (1,), (0,0), (0,0,0)]` | 4 | coherent greedy smoke output; about 33% aggregate draft acceptance (`175 / 532`) |
+
 The current production DFlash-12 setup documented in
 `~/benchmarks/2026-04-17-ultimate-v2/SUMMARY.md` reports about 45.6 tok/s
 sustained on longer outputs, with about 28% acceptance on the coding workload.
