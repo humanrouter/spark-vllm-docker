@@ -1,0 +1,49 @@
+# Recipe: experimental DFlash+DDTree prototype for Qwen3.6 NVFP4
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-DDTree
+description: vLLM serving Qwen3.6 NVFP4 with opt-in DFlash+DDTree prototype patches
+
+model: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+
+solo_only: true
+
+container: vllm-node-tf5
+
+build_args:
+  - --tf5
+
+mods:
+  - mods/ddtree-qwen36
+
+defaults:
+  port: 8011
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.8
+  max_model_len: 200000
+  max_num_batched_tokens: 32768
+  max_num_seqs: 4
+
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+  VLLM_DFLASH_DDTREE: 1
+
+command: |
+  vllm serve /root/.cache/huggingface/hub/models--RedHatAI--Qwen3.6-35B-A3B-NVFP4/snapshots/a0f3517c028f3baf8c66f4901f42e09230b6763b \
+    --served-model-name RedHatAI/Qwen3.6-35B-A3B-NVFP4-DDTree \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --trust-remote-code \
+    --attention-backend flash_attn \
+    --load-format fastsafetensors \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --structured-outputs-config '{{"backend":"xgrammar"}}' \
+    --default-chat-template-kwargs '{{"enable_thinking": false, "preserve_thinking": true}}' \
+    --override-generation-config '{{"temperature": 0.7, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.03}}'
